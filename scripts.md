@@ -73,6 +73,10 @@ G28 Y ; home Y only after ramming
 ```
 
 
+# Print Settings > Post processing scripts
+
+"C:\Python313\python.exe" "C:\Users\Powel\Documents\projects\git\cycletron\cycletron.py";
+
 # Time
 ;PRINTING_TIME: [total seconds used]
 ;REMAINING_TIME: [seconds remaining]
