@@ -198,7 +198,7 @@ def find_estimated_print_time_seconds(lines: list[str]) -> int | None:
     return matches[0][0]
 
 
-def find_global_count(lines: list[str]) -> tuple[int, int]:
+def find_global_count_optional(lines: list[str]) -> tuple[int, int] | None:
     count_matches: list[tuple[int, int]] = []
 
     for index, line in enumerate(lines):
@@ -215,7 +215,7 @@ def find_global_count(lines: list[str]) -> tuple[int, int]:
             )
 
     if not count_matches:
-        raise CycletronError("Missing @CYCLETRON_COUNT value.")
+        return None
 
     if len(count_matches) > 1:
         raise CycletronError(
@@ -230,15 +230,19 @@ def find_global_count(lines: list[str]) -> tuple[int, int]:
     return count, count_line_index
 
 
-def validate_markers(lines: list[str]) -> None:
+def validate_markers_required_for_count(lines: list[str]) -> None:
     start_count = sum(1 for line in lines if is_start_marker(line))
     end_count = sum(1 for line in lines if is_end_marker(line))
 
     if start_count == 0:
-        raise CycletronError("Missing @CYCLETRON_START marker.")
+        raise CycletronError(
+            "Found @CYCLETRON_COUNT, but missing @CYCLETRON_START marker."
+        )
 
     if end_count == 0:
-        raise CycletronError("Missing @CYCLETRON_END marker.")
+        raise CycletronError(
+            "Found @CYCLETRON_COUNT, but missing @CYCLETRON_END marker."
+        )
 
     if start_count != end_count:
         raise CycletronError(
@@ -247,9 +251,14 @@ def validate_markers(lines: list[str]) -> None:
         )
 
 
-def expand_cycletron_blocks(lines: list[str]) -> list[str]:
-    count, count_line_index = find_global_count(lines)
-    validate_markers(lines)
+def expand_cycletron_blocks_if_needed(lines: list[str]) -> list[str]:
+    count_result = find_global_count_optional(lines)
+
+    if count_result is None:
+        return list(lines)
+
+    count, count_line_index = count_result
+    validate_markers_required_for_count(lines)
 
     newline = detect_newline(lines)
     output_lines: list[str] = []
@@ -321,7 +330,9 @@ def expand_cycletron_blocks(lines: list[str]) -> list[str]:
         index += 1
 
     if block_number == 0:
-        raise CycletronError("No Cycletron blocks were processed.")
+        raise CycletronError(
+            "Found @CYCLETRON_COUNT, but no Cycletron blocks were processed."
+        )
 
     return output_lines
 
@@ -333,7 +344,10 @@ def add_m73_time_comments(
     default_newline = detect_newline(lines)
     converted_lines: list[str] = []
 
-    for line in lines:
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
         clean_line = strip_line_ending(line)
         line_ending = get_line_ending(line, default_newline)
 
@@ -341,6 +355,7 @@ def add_m73_time_comments(
 
         if not match:
             converted_lines.append(line)
+            index += 1
             continue
 
         minutes_text = match.group("minutes")
@@ -349,6 +364,7 @@ def add_m73_time_comments(
             minutes_remaining = Decimal(minutes_text)
         except InvalidOperation:
             converted_lines.append(line)
+            index += 1
             continue
 
         seconds_remaining = int(minutes_remaining * Decimal(60))
@@ -368,6 +384,8 @@ def add_m73_time_comments(
         converted_lines.append(
             f";PRINTING_TIME: {printing_time_seconds}{line_ending}"
         )
+
+        index += 1
 
     return converted_lines
 
@@ -601,8 +619,8 @@ def xor_ideamaker_payload(payload: bytes) -> bytes:
     )
 
 
-def find_png_ranges(data: bytes) -> list[tuple[int, int]]:
-    ranges: list[tuple[int, int]] = []
+def find_png_records(data: bytes) -> list[tuple[int, int, int, str]]:
+    records: list[tuple[int, int, int, str]] = []
     search_start = 0
 
     while True:
@@ -631,14 +649,37 @@ def find_png_ranges(data: bytes) -> list[tuple[int, int]]:
                     )
 
                 if chunk_type == b"IEND":
-                    ranges.append((png_start, cursor))
-                    search_start = cursor
+                    png_end = cursor
+                    png_length = png_end - png_start
+
+                    prefix_start = png_start
+                    length_mode = "none"
+
+                    if png_start >= 4:
+                        possible_prefix_start = png_start - 4
+                        prefix_value = struct.unpack(
+                            "<I",
+                            data[possible_prefix_start:png_start],
+                        )[0]
+
+                        if prefix_value == png_length + 4:
+                            prefix_start = possible_prefix_start
+                            length_mode = "plus4"
+                        elif prefix_value == png_length:
+                            prefix_start = possible_prefix_start
+                            length_mode = "exact"
+
+                    records.append(
+                        (prefix_start, png_start, png_end, length_mode)
+                    )
+
+                    search_start = png_end
                     break
 
         except CycletronError:
             search_start = png_start + 1
 
-    return ranges
+    return records
 
 
 def find_local_ideamaker_template_path(file_path: Path) -> Path | None:
@@ -684,9 +725,9 @@ def patch_ideamaker_data_template(
     encoded_payload = raw[len(IDEAMAKER_HEADER):]
     decoded_payload = xor_ideamaker_payload(encoded_payload)
 
-    png_ranges = find_png_ranges(decoded_payload)
+    png_records = find_png_records(decoded_payload)
 
-    if not png_ranges:
+    if not png_records:
         raise CycletronError(
             f"No embedded PNGs found in ideaMaker template: {template_data_path}"
         )
@@ -694,10 +735,16 @@ def patch_ideamaker_data_template(
     rebuilt_parts: list[bytes] = []
     last_end = 0
 
-    for start, end in png_ranges:
-        rebuilt_parts.append(decoded_payload[last_end:start])
+    for prefix_start, png_start, png_end, length_mode in png_records:
+        rebuilt_parts.append(decoded_payload[last_end:prefix_start])
+
+        if length_mode == "plus4":
+            rebuilt_parts.append(struct.pack("<I", len(replacement_png_bytes) + 4))
+        elif length_mode == "exact":
+            rebuilt_parts.append(struct.pack("<I", len(replacement_png_bytes)))
+
         rebuilt_parts.append(replacement_png_bytes)
-        last_end = end
+        last_end = png_end
 
     rebuilt_parts.append(decoded_payload[last_end:])
 
@@ -752,7 +799,7 @@ def process_file_in_place(file_path: Path) -> tuple[Path | None, Path | None]:
 
     color_thumbnail_png = extract_largest_thumbnail_png(lines)
 
-    expanded_lines = expand_cycletron_blocks(lines)
+    expanded_lines = expand_cycletron_blocks_if_needed(lines)
 
     if any(is_m73_line(line) for line in expanded_lines):
         total_print_seconds = find_estimated_print_time_seconds(lines)
@@ -795,7 +842,7 @@ def process_file_in_place(file_path: Path) -> tuple[Path | None, Path | None]:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Expand Cycletron-marked sections, add print-time comments, "
+            "Expand Cycletron-marked sections when present, add print-time comments, "
             "extract an embedded thumbnail PNG, and optionally generate "
             "an ideaMaker DATA file from ideamaker-template.data."
         )

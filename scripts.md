@@ -37,6 +37,8 @@ G92 E0
 ; Don't change E values below. Excessive value can damage the printer.
 {if print_settings_id=~/.*(DETAIL @MK3|QUALITY @MK3).*/}M907 E430 ; set extruder motor current{endif}
 {if print_settings_id=~/.*(SPEED @MK3|DRAFT @MK3).*/}M907 E538 ; set extruder motor current{endif}
+; input_filename_base = [input_filename_base]
+; printing_filament_types = [filament_type]
 @CYCLETRON_COUNT = 5
 @CYCLETRON_START 
 ;START_CYCLETRON
