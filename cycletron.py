@@ -35,6 +35,16 @@ M73_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+REMAINING_TIME_COMMENT_PATTERN = re.compile(
+    r"^;REMAINING_TIME:\s*\d+\s*$",
+    re.IGNORECASE,
+)
+
+PRINTING_TIME_COMMENT_PATTERN = re.compile(
+    r"^;PRINTING_TIME:\s*\d+\s*$",
+    re.IGNORECASE,
+)
+
 ESTIMATED_PRINT_TIME_PATTERN = re.compile(
     r"^;\s*estimated printing time \(normal mode\)\s*=\s*(?P<duration>.+?)\s*$",
     re.IGNORECASE,
@@ -70,10 +80,26 @@ MESSAGE_DELAY_MS = 1000
 IDEAMAKER_TEMPLATE_FILENAME = "ideamaker-template.data"
 IDEAMAKER_HEADER = b"IDEA - PRINTDATA"
 
-IDEAMAKER_XOR_KEY = bytes.fromhex(
+IDEAMAKER_BASE_XOR_KEY = bytes.fromhex(
     "e93f2d3d81a3917dfff1201eae0567eb"
     "84b75a370ca87c3f1d00e9d54d4a7b14"
 )
+
+IDEAMAKER_VARIABLE_KEY_MODS = {
+    0, 1,
+    8, 9,
+    16, 17,
+    24, 25,
+}
+
+IDEAMAKER_KEY_PROBES = [
+    (73, b"acceleration_bottom"),
+    (107, b"acceleration_bottom_surface"),
+    (149, b"acceleration_first_layer"),
+    (188, b"acceleration_infill"),
+    (222, b"acceleration_inset_inner"),
+    (261, b"acceleration_inset_outer"),
+]
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
@@ -117,6 +143,15 @@ def is_end_marker(line: str) -> bool:
 
 def is_m73_line(line: str) -> bool:
     return bool(M73_PATTERN.match(strip_line_ending(line)))
+
+
+def is_time_helper_comment(line: str) -> bool:
+    clean_line = strip_line_ending(line)
+
+    return bool(
+        REMAINING_TIME_COMMENT_PATTERN.match(clean_line)
+        or PRINTING_TIME_COMMENT_PATTERN.match(clean_line)
+    )
 
 
 def parse_duration_to_seconds(duration_text: str) -> int:
@@ -203,7 +238,6 @@ def find_global_count_optional(lines: list[str]) -> tuple[int, int] | None:
 
     for index, line in enumerate(lines):
         clean_line = strip_line_ending(line)
-
         match = COUNT_PATTERN.match(clean_line)
 
         if match:
@@ -386,6 +420,9 @@ def add_m73_time_comments(
         )
 
         index += 1
+
+        while index < len(lines) and is_time_helper_comment(lines[index]):
+            index += 1
 
     return converted_lines
 
@@ -612,11 +649,64 @@ def write_thumbnail_png_with_dialog(
     return output_path
 
 
-def xor_ideamaker_payload(payload: bytes) -> bytes:
+def apply_ideamaker_xor(payload: bytes, xor_key: bytes) -> bytes:
     return bytes(
-        byte ^ IDEAMAKER_XOR_KEY[index % len(IDEAMAKER_XOR_KEY)]
+        byte ^ xor_key[index % len(xor_key)]
         for index, byte in enumerate(payload)
     )
+
+
+def infer_ideamaker_xor_key(encoded_payload: bytes) -> bytes:
+    key = bytearray(IDEAMAKER_BASE_XOR_KEY)
+
+    candidates_by_mod: dict[int, list[int]] = {
+        mod: [] for mod in IDEAMAKER_VARIABLE_KEY_MODS
+    }
+
+    for offset, known_plaintext in IDEAMAKER_KEY_PROBES:
+        if offset + len(known_plaintext) > len(encoded_payload):
+            continue
+
+        for relative_index, plaintext_byte in enumerate(known_plaintext):
+            payload_index = offset + relative_index
+            key_mod = payload_index % len(key)
+
+            if key_mod not in IDEAMAKER_VARIABLE_KEY_MODS:
+                continue
+
+            candidate_key_byte = encoded_payload[payload_index] ^ plaintext_byte
+            candidates_by_mod[key_mod].append(candidate_key_byte)
+
+    missing_mods = []
+
+    for key_mod in IDEAMAKER_VARIABLE_KEY_MODS:
+        candidates = candidates_by_mod[key_mod]
+
+        if not candidates:
+            missing_mods.append(key_mod)
+            continue
+
+        key[key_mod] = max(set(candidates), key=candidates.count)
+
+    if missing_mods:
+        missing_text = ", ".join(str(mod) for mod in sorted(missing_mods))
+        raise CycletronError(
+            "Could not infer ideaMaker XOR key. "
+            f"Missing key bytes for mods: {missing_text}"
+        )
+
+    decoded_payload = apply_ideamaker_xor(encoded_payload, bytes(key))
+
+    for offset, known_plaintext in IDEAMAKER_KEY_PROBES[:3]:
+        if offset + len(known_plaintext) > len(decoded_payload):
+            continue
+
+        if decoded_payload[offset:offset + len(known_plaintext)] != known_plaintext:
+            raise CycletronError(
+                "Inferred ideaMaker XOR key did not validate against known settings."
+            )
+
+    return bytes(key)
 
 
 def find_png_records(data: bytes) -> list[tuple[int, int, int, str]]:
@@ -723,7 +813,9 @@ def patch_ideamaker_data_template(
         )
 
     encoded_payload = raw[len(IDEAMAKER_HEADER):]
-    decoded_payload = xor_ideamaker_payload(encoded_payload)
+
+    xor_key = infer_ideamaker_xor_key(encoded_payload)
+    decoded_payload = apply_ideamaker_xor(encoded_payload, xor_key)
 
     png_records = find_png_records(decoded_payload)
 
@@ -748,8 +840,20 @@ def patch_ideamaker_data_template(
 
     rebuilt_parts.append(decoded_payload[last_end:])
 
-    rebuilt_decoded_payload = b"".join(rebuilt_parts)
-    rebuilt_encoded_payload = xor_ideamaker_payload(rebuilt_decoded_payload)
+    rebuilt_decoded_payload = bytearray(b"".join(rebuilt_parts))
+
+    if len(rebuilt_decoded_payload) < 20:
+        raise CycletronError(
+            "ideaMaker decoded payload is too short to update size field."
+        )
+
+    total_output_size = len(IDEAMAKER_HEADER) + len(rebuilt_decoded_payload)
+    struct.pack_into("<I", rebuilt_decoded_payload, 16, total_output_size)
+
+    rebuilt_encoded_payload = apply_ideamaker_xor(
+        bytes(rebuilt_decoded_payload),
+        xor_key,
+    )
 
     output_data_path.write_bytes(IDEAMAKER_HEADER + rebuilt_encoded_payload)
 
