@@ -82,3 +82,5 @@ G28 Y ; home Y only after ramming
 # Time
 ;PRINTING_TIME: [total seconds used]
 ;REMAINING_TIME: [seconds remaining]
+
+; input_filename_base = [input_filename_base]

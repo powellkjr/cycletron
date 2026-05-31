@@ -30,6 +30,11 @@ END_MARKER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+INIT_TIME_PATTERN = re.compile(
+    r"^@INIT_TIME\s*(?:;.*)?\s*$",
+    re.IGNORECASE,
+)
+
 M73_PATTERN = re.compile(
     r"^M73\s+P(?P<percent>\d+(?:\.\d+)?)\s+R(?P<minutes>\d+(?:\.\d+)?)(?:\s*;.*)?\s*$",
     re.IGNORECASE,
@@ -139,6 +144,10 @@ def is_start_marker(line: str) -> bool:
 
 def is_end_marker(line: str) -> bool:
     return bool(END_MARKER_PATTERN.match(strip_line_ending(line)))
+
+
+def is_init_time_marker(line: str) -> bool:
+    return bool(INIT_TIME_PATTERN.match(strip_line_ending(line)))
 
 
 def is_m73_line(line: str) -> bool:
@@ -371,6 +380,29 @@ def expand_cycletron_blocks_if_needed(lines: list[str]) -> list[str]:
     return output_lines
 
 
+def replace_init_time_marker(
+    lines: list[str],
+    total_print_seconds: int,
+) -> list[str]:
+    default_newline = detect_newline(lines)
+    output_lines: list[str] = []
+
+    for line in lines:
+        clean_line = strip_line_ending(line)
+        line_ending = get_line_ending(line, default_newline)
+
+        if INIT_TIME_PATTERN.match(clean_line):
+            output_lines.append(f";PRINTING_TIME: 0{line_ending}")
+            output_lines.append(
+                f";REMAINING_TIME: {total_print_seconds}{line_ending}"
+            )
+            continue
+
+        output_lines.append(line)
+
+    return output_lines
+
+
 def add_m73_time_comments(
     lines: list[str],
     total_print_seconds: int,
@@ -413,10 +445,10 @@ def add_m73_time_comments(
             converted_lines.append(f"{line}{line_ending}")
 
         converted_lines.append(
-            f";REMAINING_TIME: {seconds_remaining}{line_ending}"
+            f";PRINTING_TIME: {printing_time_seconds}{line_ending}"
         )
         converted_lines.append(
-            f";PRINTING_TIME: {printing_time_seconds}{line_ending}"
+            f";REMAINING_TIME: {seconds_remaining}{line_ending}"
         )
 
         index += 1
@@ -772,6 +804,55 @@ def find_png_records(data: bytes) -> list[tuple[int, int, int, str]]:
     return records
 
 
+def build_ideamaker_xor_key_for_output_size(
+    template_key: bytes,
+    template_total_size: int,
+    output_total_size: int,
+) -> bytes:
+    key = bytearray(template_key)
+
+    old_low = template_total_size & 0xFFFF
+    new_low = output_total_size & 0xFFFF
+    delta = (new_low - old_low) & 0xFFFF
+
+    for offset in (0, 8, 16, 24):
+        old_pair = key[offset] | (key[offset + 1] << 8)
+        new_pair = (old_pair + delta) & 0xFFFF
+
+        key[offset] = new_pair & 0xFF
+        key[offset + 1] = (new_pair >> 8) & 0xFF
+
+    return bytes(key)
+
+
+def update_ideamaker_decoded_header_for_output_key(
+    decoded_payload: bytearray,
+    original_encoded_payload: bytes,
+    output_xor_key: bytes,
+    output_total_size: int,
+) -> None:
+    if len(decoded_payload) < 28:
+        raise CycletronError("ideaMaker decoded payload is too short.")
+
+    struct.pack_into("<I", decoded_payload, 16, output_total_size)
+
+    for offset in (0, 8):
+        original_encoded_pair = (
+            original_encoded_payload[offset]
+            | (original_encoded_payload[offset + 1] << 8)
+        )
+
+        output_key_pair = (
+            output_xor_key[offset]
+            | (output_xor_key[offset + 1] << 8)
+        )
+
+        decoded_pair = original_encoded_pair ^ output_key_pair
+
+        decoded_payload[offset] = decoded_pair & 0xFF
+        decoded_payload[offset + 1] = (decoded_pair >> 8) & 0xFF
+
+
 def find_local_ideamaker_template_path(file_path: Path) -> Path | None:
     candidate_paths: list[Path] = []
 
@@ -812,10 +893,13 @@ def patch_ideamaker_data_template(
             f"Template file is not an ideaMaker PRINTDATA file: {template_data_path}"
         )
 
-    encoded_payload = raw[len(IDEAMAKER_HEADER):]
+    original_encoded_payload = raw[len(IDEAMAKER_HEADER):]
 
-    xor_key = infer_ideamaker_xor_key(encoded_payload)
-    decoded_payload = apply_ideamaker_xor(encoded_payload, xor_key)
+    template_xor_key = infer_ideamaker_xor_key(original_encoded_payload)
+    decoded_payload = apply_ideamaker_xor(
+        original_encoded_payload,
+        template_xor_key,
+    )
 
     png_records = find_png_records(decoded_payload)
 
@@ -841,18 +925,24 @@ def patch_ideamaker_data_template(
     rebuilt_parts.append(decoded_payload[last_end:])
 
     rebuilt_decoded_payload = bytearray(b"".join(rebuilt_parts))
+    output_total_size = len(IDEAMAKER_HEADER) + len(rebuilt_decoded_payload)
 
-    if len(rebuilt_decoded_payload) < 20:
-        raise CycletronError(
-            "ideaMaker decoded payload is too short to update size field."
-        )
+    output_xor_key = build_ideamaker_xor_key_for_output_size(
+        template_key=template_xor_key,
+        template_total_size=len(raw),
+        output_total_size=output_total_size,
+    )
 
-    total_output_size = len(IDEAMAKER_HEADER) + len(rebuilt_decoded_payload)
-    struct.pack_into("<I", rebuilt_decoded_payload, 16, total_output_size)
+    update_ideamaker_decoded_header_for_output_key(
+        decoded_payload=rebuilt_decoded_payload,
+        original_encoded_payload=original_encoded_payload,
+        output_xor_key=output_xor_key,
+        output_total_size=output_total_size,
+    )
 
     rebuilt_encoded_payload = apply_ideamaker_xor(
         bytes(rebuilt_decoded_payload),
-        xor_key,
+        output_xor_key,
     )
 
     output_data_path.write_bytes(IDEAMAKER_HEADER + rebuilt_encoded_payload)
@@ -905,18 +995,28 @@ def process_file_in_place(file_path: Path) -> tuple[Path | None, Path | None]:
 
     expanded_lines = expand_cycletron_blocks_if_needed(lines)
 
-    if any(is_m73_line(line) for line in expanded_lines):
+    needs_print_time = (
+        any(is_m73_line(line) for line in expanded_lines)
+        or any(is_init_time_marker(line) for line in expanded_lines)
+    )
+
+    if needs_print_time:
         total_print_seconds = find_estimated_print_time_seconds(lines)
 
         if total_print_seconds is None:
             raise CycletronError(
-                "Found M73 lines, but missing estimated printing time comment. "
+                "Found M73 lines or @INIT_TIME, but missing estimated printing time comment. "
                 "Expected a line like: "
                 "; estimated printing time (normal mode) = 1h 20m 11s"
             )
 
-        output_lines = add_m73_time_comments(
+        output_lines = replace_init_time_marker(
             expanded_lines,
+            total_print_seconds,
+        )
+
+        output_lines = add_m73_time_comments(
+            output_lines,
             total_print_seconds,
         )
     else:
