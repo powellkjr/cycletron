@@ -3,6 +3,7 @@
 import argparse
 import base64
 import binascii
+import hashlib
 import re
 import struct
 import sys
@@ -741,6 +742,30 @@ def infer_ideamaker_xor_key(encoded_payload: bytes) -> bytes:
     return bytes(key)
 
 
+def get_png_end_offset(png_bytes: bytes) -> int:
+    if not png_bytes.startswith(PNG_SIGNATURE):
+        raise CycletronError("Replacement image is not a valid PNG.")
+
+    cursor = len(PNG_SIGNATURE)
+
+    while True:
+        if cursor + 8 > len(png_bytes):
+            raise CycletronError(
+                "PNG ended unexpectedly while scanning replacement image."
+            )
+
+        chunk_length = struct.unpack(">I", png_bytes[cursor:cursor + 4])[0]
+        chunk_type = png_bytes[cursor + 4:cursor + 8]
+
+        cursor += 8 + chunk_length + 4
+
+        if cursor > len(png_bytes):
+            raise CycletronError("PNG chunk extends beyond replacement image.")
+
+        if chunk_type == b"IEND":
+            return cursor
+
+
 def find_png_records(data: bytes) -> list[tuple[int, int, int, str]]:
     records: list[tuple[int, int, int, str]] = []
     search_start = 0
@@ -804,53 +829,198 @@ def find_png_records(data: bytes) -> list[tuple[int, int, int, str]]:
     return records
 
 
-def build_ideamaker_xor_key_for_output_size(
-    template_key: bytes,
-    template_total_size: int,
-    output_total_size: int,
-) -> bytes:
-    key = bytearray(template_key)
+def pad_png_to_exact_length(png_bytes: bytes, target_length: int) -> bytes:
+    png_end = get_png_end_offset(png_bytes)
+    clean_png = png_bytes[:png_end]
 
-    old_low = template_total_size & 0xFFFF
-    new_low = output_total_size & 0xFFFF
-    delta = (new_low - old_low) & 0xFFFF
+    if len(clean_png) > target_length:
+        raise CycletronError(
+            f"PNG is too large for ideaMaker template record. "
+            f"PNG size is {len(clean_png)} bytes, but record capacity is {target_length} bytes."
+        )
 
-    for offset in (0, 8, 16, 24):
-        old_pair = key[offset] | (key[offset + 1] << 8)
-        new_pair = (old_pair + delta) & 0xFFFF
+    pad_needed = target_length - len(clean_png)
 
-        key[offset] = new_pair & 0xFF
-        key[offset + 1] = (new_pair >> 8) & 0xFF
+    if pad_needed == 0:
+        return clean_png
 
-    return bytes(key)
+    if pad_needed >= 12:
+        import zlib
+
+        iend_start = clean_png.rfind(b"\x00\x00\x00\x00IEND")
+
+        if iend_start == -1:
+            raise CycletronError("Could not locate IEND chunk while padding PNG.")
+
+        chunk_type = b"paDd"
+        chunk_data = b"\x00" * (pad_needed - 12)
+        chunk_crc = zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
+
+        padding_chunk = (
+            struct.pack(">I", len(chunk_data))
+            + chunk_type
+            + chunk_data
+            + struct.pack(">I", chunk_crc)
+        )
+
+        return clean_png[:iend_start] + padding_chunk + clean_png[iend_start:]
+
+    return clean_png + (b"\x00" * pad_needed)
 
 
-def update_ideamaker_decoded_header_for_output_key(
+def resize_png_to_fit_capacity(png_bytes: bytes, target_length: int) -> bytes:
+    clean_length = get_png_end_offset(png_bytes)
+
+    if clean_length <= target_length:
+        return pad_png_to_exact_length(png_bytes, target_length)
+
+    try:
+        from PIL import Image
+        from io import BytesIO
+    except ImportError as error:
+        raise CycletronError(
+            "Replacement PNG is too large for the ideaMaker template record, "
+            "and Pillow is not installed to resize it. Install with: pip install pillow"
+        ) from error
+
+    with BytesIO(png_bytes) as input_buffer:
+        image = Image.open(input_buffer)
+        image.load()
+
+    original_width, original_height = image.size
+
+    for scale_percent in range(95, 9, -5):
+        new_width = max(1, int(original_width * scale_percent / 100))
+        new_height = max(1, int(original_height * scale_percent / 100))
+
+        resized = image.resize((new_width, new_height))
+        output_buffer = BytesIO()
+        resized.save(output_buffer, format="PNG", optimize=True, compress_level=9)
+        candidate = output_buffer.getvalue()
+
+        if get_png_end_offset(candidate) <= target_length:
+            return pad_png_to_exact_length(candidate, target_length)
+
+    raise CycletronError(
+        f"Could not resize replacement PNG small enough for ideaMaker record "
+        f"capacity of {target_length} bytes."
+    )
+
+
+def find_setting_entry(
+    decoded_payload: bytes,
+    setting_name: str,
+) -> tuple[int, int, int]:
+    name_bytes = setting_name.encode("ascii")
+    marker = struct.pack("<I", len(name_bytes)) + name_bytes + b"\x00"
+
+    start = decoded_payload.find(marker)
+
+    if start == -1:
+        raise CycletronError(f"Could not find ideaMaker setting: {setting_name}")
+
+    type_offset = start + len(marker)
+
+    if type_offset >= len(decoded_payload):
+        raise CycletronError(f"ideaMaker setting is truncated: {setting_name}")
+
+    setting_type = decoded_payload[type_offset]
+    value_offset = type_offset + 1
+
+    return start, setting_type, value_offset
+
+
+def patch_ideamaker_double_setting(
     decoded_payload: bytearray,
-    original_encoded_payload: bytes,
-    output_xor_key: bytes,
-    output_total_size: int,
+    setting_name: str,
+    value: float,
 ) -> None:
-    if len(decoded_payload) < 28:
-        raise CycletronError("ideaMaker decoded payload is too short.")
+    _, setting_type, value_offset = find_setting_entry(
+        decoded_payload,
+        setting_name,
+    )
 
-    struct.pack_into("<I", decoded_payload, 16, output_total_size)
-
-    for offset in (0, 8):
-        original_encoded_pair = (
-            original_encoded_payload[offset]
-            | (original_encoded_payload[offset + 1] << 8)
+    if setting_type != 1:
+        raise CycletronError(
+            f"Expected {setting_name} to be a numeric setting, "
+            f"but found type {setting_type}."
         )
 
-        output_key_pair = (
-            output_xor_key[offset]
-            | (output_xor_key[offset + 1] << 8)
+    if value_offset + 8 > len(decoded_payload):
+        raise CycletronError(
+            f"ideaMaker numeric setting is truncated: {setting_name}"
         )
 
-        decoded_pair = original_encoded_pair ^ output_key_pair
+    struct.pack_into("<d", decoded_payload, value_offset, value)
 
-        decoded_payload[offset] = decoded_pair & 0xFF
-        decoded_payload[offset + 1] = (decoded_pair >> 8) & 0xFF
+
+def patch_ideamaker_string_setting(
+    decoded_payload: bytearray,
+    setting_name: str,
+    value: str,
+) -> None:
+    _, setting_type, value_offset = find_setting_entry(
+        decoded_payload,
+        setting_name,
+    )
+
+    if setting_type != 3:
+        raise CycletronError(
+            f"Expected {setting_name} to be a string setting, "
+            f"but found type {setting_type}."
+        )
+
+    if value_offset + 4 > len(decoded_payload):
+        raise CycletronError(f"ideaMaker string setting is truncated: {setting_name}")
+
+    old_length = struct.unpack_from("<I", decoded_payload, value_offset)[0]
+    value_bytes = value.encode("ascii")
+
+    if len(value_bytes) != old_length:
+        raise CycletronError(
+            f"Replacement value for {setting_name} must be exactly "
+            f"{old_length} bytes, but got {len(value_bytes)}."
+        )
+
+    string_start = value_offset + 4
+    string_end = string_start + old_length
+
+    if string_end > len(decoded_payload):
+        raise CycletronError(f"ideaMaker string value is truncated: {setting_name}")
+
+    decoded_payload[string_start:string_end] = value_bytes
+
+
+def build_gcode_verify_code(gcode_bytes: bytes) -> str:
+    digest = hashlib.md5(gcode_bytes).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def patch_ideamaker_gcode_verify_settings(
+    decoded_payload: bytearray,
+    gcode_bytes: bytes,
+) -> None:
+    verify_offset = 0
+    verify_length = len(gcode_bytes)
+    verify_code = build_gcode_verify_code(gcode_bytes)
+
+    patch_ideamaker_double_setting(
+        decoded_payload,
+        "gcode_verify_offset",
+        float(verify_offset),
+    )
+
+    patch_ideamaker_double_setting(
+        decoded_payload,
+        "gcode_verify_length",
+        float(verify_length),
+    )
+
+    patch_ideamaker_string_setting(
+        decoded_payload,
+        "gcode_verify_code",
+        verify_code,
+    )
 
 
 def find_local_ideamaker_template_path(file_path: Path) -> Path | None:
@@ -885,6 +1055,7 @@ def patch_ideamaker_data_template(
     template_data_path: Path,
     output_data_path: Path,
     replacement_png_bytes: bytes,
+    gcode_bytes: bytes,
 ) -> None:
     raw = template_data_path.read_bytes()
 
@@ -908,50 +1079,49 @@ def patch_ideamaker_data_template(
             f"No embedded PNGs found in ideaMaker template: {template_data_path}"
         )
 
-    rebuilt_parts: list[bytes] = []
-    last_end = 0
+    rebuilt_payload = bytearray(decoded_payload)
 
-    for prefix_start, png_start, png_end, length_mode in png_records:
-        rebuilt_parts.append(decoded_payload[last_end:prefix_start])
+    for _, png_start, png_end, _ in png_records:
+        original_png_capacity = png_end - png_start
 
-        if length_mode == "plus4":
-            rebuilt_parts.append(struct.pack("<I", len(replacement_png_bytes) + 4))
-        elif length_mode == "exact":
-            rebuilt_parts.append(struct.pack("<I", len(replacement_png_bytes)))
+        fitted_png = resize_png_to_fit_capacity(
+            replacement_png_bytes,
+            original_png_capacity,
+        )
 
-        rebuilt_parts.append(replacement_png_bytes)
-        last_end = png_end
+        if len(fitted_png) != original_png_capacity:
+            raise CycletronError(
+                "Internal error: fitted PNG did not match template record size."
+            )
 
-    rebuilt_parts.append(decoded_payload[last_end:])
+        rebuilt_payload[png_start:png_end] = fitted_png
 
-    rebuilt_decoded_payload = bytearray(b"".join(rebuilt_parts))
-    output_total_size = len(IDEAMAKER_HEADER) + len(rebuilt_decoded_payload)
-
-    output_xor_key = build_ideamaker_xor_key_for_output_size(
-        template_key=template_xor_key,
-        template_total_size=len(raw),
-        output_total_size=output_total_size,
-    )
-
-    update_ideamaker_decoded_header_for_output_key(
-        decoded_payload=rebuilt_decoded_payload,
-        original_encoded_payload=original_encoded_payload,
-        output_xor_key=output_xor_key,
-        output_total_size=output_total_size,
+    patch_ideamaker_gcode_verify_settings(
+        rebuilt_payload,
+        gcode_bytes,
     )
 
     rebuilt_encoded_payload = apply_ideamaker_xor(
-        bytes(rebuilt_decoded_payload),
-        output_xor_key,
+        bytes(rebuilt_payload),
+        template_xor_key,
     )
 
-    output_data_path.write_bytes(IDEAMAKER_HEADER + rebuilt_encoded_payload)
+    output_bytes = IDEAMAKER_HEADER + rebuilt_encoded_payload
+
+    if len(output_bytes) != len(raw):
+        raise CycletronError(
+            "Internal error: patched ideaMaker DATA size changed. "
+            "That should not happen with fixed-size patching."
+        )
+
+    output_data_path.write_bytes(output_bytes)
 
 
 def write_ideamaker_data_if_template_exists(
     file_path: Path,
     png_output_path: Path | None,
     replacement_png_bytes: bytes,
+    gcode_bytes: bytes,
 ) -> Path | None:
     if png_output_path is None:
         return None
@@ -967,6 +1137,7 @@ def write_ideamaker_data_if_template_exists(
         template_data_path=template_data_path,
         output_data_path=output_data_path,
         replacement_png_bytes=replacement_png_bytes,
+        gcode_bytes=gcode_bytes,
     )
 
     return output_data_path
@@ -980,7 +1151,8 @@ def process_file_in_place(file_path: Path) -> tuple[Path | None, Path | None]:
         raise CycletronError(f"Path is not a file: {file_path}")
 
     try:
-        original_text = file_path.read_text(encoding="utf-8")
+        original_bytes = file_path.read_bytes()
+        original_text = original_bytes.decode("utf-8")
     except UnicodeDecodeError:
         raise CycletronError(
             "Could not read file as UTF-8. Save the G-code file as UTF-8 and try again."
@@ -1022,7 +1194,10 @@ def process_file_in_place(file_path: Path) -> tuple[Path | None, Path | None]:
     else:
         output_lines = expanded_lines
 
-    file_path.write_text("".join(output_lines), encoding="utf-8")
+    final_gcode_text = "".join(output_lines)
+    final_gcode_bytes = final_gcode_text.encode("utf-8")
+
+    file_path.write_bytes(final_gcode_bytes)
 
     thumbnail_output_path = None
     data_output_path = None
@@ -1038,6 +1213,7 @@ def process_file_in_place(file_path: Path) -> tuple[Path | None, Path | None]:
             file_path=file_path,
             png_output_path=thumbnail_output_path,
             replacement_png_bytes=color_thumbnail_png,
+            gcode_bytes=final_gcode_bytes,
         )
 
     return thumbnail_output_path, data_output_path
