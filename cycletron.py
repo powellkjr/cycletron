@@ -829,84 +829,6 @@ def find_png_records(data: bytes) -> list[tuple[int, int, int, str]]:
     return records
 
 
-def pad_png_to_exact_length(png_bytes: bytes, target_length: int) -> bytes:
-    png_end = get_png_end_offset(png_bytes)
-    clean_png = png_bytes[:png_end]
-
-    if len(clean_png) > target_length:
-        raise CycletronError(
-            f"PNG is too large for ideaMaker template record. "
-            f"PNG size is {len(clean_png)} bytes, but record capacity is {target_length} bytes."
-        )
-
-    pad_needed = target_length - len(clean_png)
-
-    if pad_needed == 0:
-        return clean_png
-
-    if pad_needed >= 12:
-        import zlib
-
-        iend_start = clean_png.rfind(b"\x00\x00\x00\x00IEND")
-
-        if iend_start == -1:
-            raise CycletronError("Could not locate IEND chunk while padding PNG.")
-
-        chunk_type = b"paDd"
-        chunk_data = b"\x00" * (pad_needed - 12)
-        chunk_crc = zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
-
-        padding_chunk = (
-            struct.pack(">I", len(chunk_data))
-            + chunk_type
-            + chunk_data
-            + struct.pack(">I", chunk_crc)
-        )
-
-        return clean_png[:iend_start] + padding_chunk + clean_png[iend_start:]
-
-    return clean_png + (b"\x00" * pad_needed)
-
-
-def resize_png_to_fit_capacity(png_bytes: bytes, target_length: int) -> bytes:
-    clean_length = get_png_end_offset(png_bytes)
-
-    if clean_length <= target_length:
-        return pad_png_to_exact_length(png_bytes, target_length)
-
-    try:
-        from PIL import Image
-        from io import BytesIO
-    except ImportError as error:
-        raise CycletronError(
-            "Replacement PNG is too large for the ideaMaker template record, "
-            "and Pillow is not installed to resize it. Install with: pip install pillow"
-        ) from error
-
-    with BytesIO(png_bytes) as input_buffer:
-        image = Image.open(input_buffer)
-        image.load()
-
-    original_width, original_height = image.size
-
-    for scale_percent in range(95, 9, -5):
-        new_width = max(1, int(original_width * scale_percent / 100))
-        new_height = max(1, int(original_height * scale_percent / 100))
-
-        resized = image.resize((new_width, new_height))
-        output_buffer = BytesIO()
-        resized.save(output_buffer, format="PNG", optimize=True, compress_level=9)
-        candidate = output_buffer.getvalue()
-
-        if get_png_end_offset(candidate) <= target_length:
-            return pad_png_to_exact_length(candidate, target_length)
-
-    raise CycletronError(
-        f"Could not resize replacement PNG small enough for ideaMaker record "
-        f"capacity of {target_length} bytes."
-    )
-
-
 def find_setting_entry(
     decoded_payload: bytes,
     setting_name: str,
@@ -1023,6 +945,55 @@ def patch_ideamaker_gcode_verify_settings(
     )
 
 
+def build_ideamaker_xor_key_for_output_size(
+    template_key: bytes,
+    template_total_size: int,
+    output_total_size: int,
+) -> bytes:
+    key = bytearray(template_key)
+
+    old_low = template_total_size & 0xFFFF
+    new_low = output_total_size & 0xFFFF
+    delta = (new_low - old_low) & 0xFFFF
+
+    for offset in (0, 8, 16, 24):
+        old_pair = key[offset] | (key[offset + 1] << 8)
+        new_pair = (old_pair + delta) & 0xFFFF
+
+        key[offset] = new_pair & 0xFF
+        key[offset + 1] = (new_pair >> 8) & 0xFF
+
+    return bytes(key)
+
+
+def update_ideamaker_decoded_header_for_output_key(
+    decoded_payload: bytearray,
+    original_encoded_payload: bytes,
+    output_xor_key: bytes,
+    output_total_size: int,
+) -> None:
+    if len(decoded_payload) < 28:
+        raise CycletronError("ideaMaker decoded payload is too short.")
+
+    struct.pack_into("<I", decoded_payload, 16, output_total_size)
+
+    for offset in (0, 8):
+        original_encoded_pair = (
+            original_encoded_payload[offset]
+            | (original_encoded_payload[offset + 1] << 8)
+        )
+
+        output_key_pair = (
+            output_xor_key[offset]
+            | (output_xor_key[offset + 1] << 8)
+        )
+
+        decoded_pair = original_encoded_pair ^ output_key_pair
+
+        decoded_payload[offset] = decoded_pair & 0xFF
+        decoded_payload[offset + 1] = (decoded_pair >> 8) & 0xFF
+
+
 def find_local_ideamaker_template_path(file_path: Path) -> Path | None:
     candidate_paths: list[Path] = []
 
@@ -1079,42 +1050,53 @@ def patch_ideamaker_data_template(
             f"No embedded PNGs found in ideaMaker template: {template_data_path}"
         )
 
-    rebuilt_payload = bytearray(decoded_payload)
+    replacement_png_end = get_png_end_offset(replacement_png_bytes)
+    clean_replacement_png = replacement_png_bytes[:replacement_png_end]
 
-    for _, png_start, png_end, _ in png_records:
-        original_png_capacity = png_end - png_start
+    rebuilt_parts: list[bytes] = []
+    last_end = 0
 
-        fitted_png = resize_png_to_fit_capacity(
-            replacement_png_bytes,
-            original_png_capacity,
-        )
+    for prefix_start, png_start, png_end, length_mode in png_records:
+        rebuilt_parts.append(decoded_payload[last_end:prefix_start])
 
-        if len(fitted_png) != original_png_capacity:
-            raise CycletronError(
-                "Internal error: fitted PNG did not match template record size."
-            )
+        if length_mode == "plus4":
+            rebuilt_parts.append(struct.pack("<I", len(clean_replacement_png) + 4))
+        elif length_mode == "exact":
+            rebuilt_parts.append(struct.pack("<I", len(clean_replacement_png)))
 
-        rebuilt_payload[png_start:png_end] = fitted_png
+        rebuilt_parts.append(clean_replacement_png)
+        last_end = png_end
+
+    rebuilt_parts.append(decoded_payload[last_end:])
+
+    rebuilt_payload = bytearray(b"".join(rebuilt_parts))
 
     patch_ideamaker_gcode_verify_settings(
         rebuilt_payload,
         gcode_bytes,
     )
 
-    rebuilt_encoded_payload = apply_ideamaker_xor(
-        bytes(rebuilt_payload),
-        template_xor_key,
+    output_total_size = len(IDEAMAKER_HEADER) + len(rebuilt_payload)
+
+    output_xor_key = build_ideamaker_xor_key_for_output_size(
+        template_key=template_xor_key,
+        template_total_size=len(raw),
+        output_total_size=output_total_size,
     )
 
-    output_bytes = IDEAMAKER_HEADER + rebuilt_encoded_payload
+    update_ideamaker_decoded_header_for_output_key(
+        decoded_payload=rebuilt_payload,
+        original_encoded_payload=original_encoded_payload,
+        output_xor_key=output_xor_key,
+        output_total_size=output_total_size,
+    )
 
-    if len(output_bytes) != len(raw):
-        raise CycletronError(
-            "Internal error: patched ideaMaker DATA size changed. "
-            "That should not happen with fixed-size patching."
-        )
+    rebuilt_encoded_payload = apply_ideamaker_xor(
+        bytes(rebuilt_payload),
+        output_xor_key,
+    )
 
-    output_data_path.write_bytes(output_bytes)
+    output_data_path.write_bytes(IDEAMAKER_HEADER + rebuilt_encoded_payload)
 
 
 def write_ideamaker_data_if_template_exists(
